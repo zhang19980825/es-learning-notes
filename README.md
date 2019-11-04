@@ -1130,5 +1130,489 @@ PUT /test_index/test_type/6
   }
 }
 ```
-我们会发现，在删除一个document之后，可以从一个侧面证明，它不是立即物理删除掉的，因为它的一些版本号等信息还是保留着的。先删除一条document，再重新创建这条document，其实会在delete version基础之上，再把version号加1
+我们会发现，在删除一个document之后，可以从一个侧面证明，它不是立即物理删除掉的，因为它的一些版本号等信息还是保留着的。先删除一条document，再重新创建这条document，其实会在delete version基础之上，再把version号加1  
+### 20191104  
+1、上机动手实战演练基于_version进行乐观锁并发控制
+
+（1）先构造一条数据出来
+```
+PUT /test_index/test_type/7
+{
+  "test_field": "test test"
+}
+```
+（2）模拟两个客户端，都获取到了同一条数据
+```
+GET test_index/test_type/7
+
+{
+  "_index": "test_index",
+  "_type": "test_type",
+  "_id": "7",
+  "_version": 1,
+  "found": true,
+  "_source": {
+    "test_field": "test test"
+  }
+}
+```
+（3）其中一个客户端，先更新了一下这个数据
+
+同时带上数据的版本号，确保说，es中的数据的版本号，跟客户端中的数据的版本号是相同的，才能修改
+```
+PUT /test_index/test_type/7?version=1 
+{
+  "test_field": "test client 1"
+}
+
+{
+  "_index": "test_index",
+  "_type": "test_type",
+  "_id": "7",
+  "_version": 2,
+  "result": "updated",
+  "_shards": {
+    "total": 2,
+    "successful": 1,
+    "failed": 0
+  },
+  "created": false
+}
+```
+（4）另外一个客户端，尝试基于version=1的数据去进行修改，同样带上version版本号，进行乐观锁的并发控制
+```
+PUT /test_index/test_type/7?version=1 
+{
+  "test_field": "test client 2"
+}
+
+{
+  "error": {
+    "root_cause": [
+      {
+        "type": "version_conflict_engine_exception",
+        "reason": "[test_type][7]: version conflict, current version [2] is different than the one provided [1]",
+        "index_uuid": "6m0G7yx7R1KECWWGnfH1sw",
+        "shard": "3",
+        "index": "test_index"
+      }
+    ],
+    "type": "version_conflict_engine_exception",
+    "reason": "[test_type][7]: version conflict, current version [2] is different than the one provided [1]",
+    "index_uuid": "6m0G7yx7R1KECWWGnfH1sw",
+    "shard": "3",
+    "index": "test_index"
+  },
+  "status": 409
+}
+```
+（5）在乐观锁成功阻止并发问题之后，尝试正确的完成更新
+```
+GET /test_index/test_type/7
+
+{
+  "_index": "test_index",
+  "_type": "test_type",
+  "_id": "7",
+  "_version": 2,
+  "found": true,
+  "_source": {
+    "test_field": "test client 1"
+  }
+}
+```
+基于最新的数据和版本号，去进行修改，修改后，带上最新的版本号，可能这个步骤会需要反复执行好几次，才能成功，特别是在多线程并发更新同一条数据很频繁的情况下
+```
+PUT /test_index/test_type/7?version=2 
+{
+  "test_field": "test client 2"
+}
+
+{
+  "_index": "test_index",
+  "_type": "test_type",
+  "_id": "7",
+  "_version": 3,
+  "result": "updated",
+  "_shards": {
+    "total": 2,
+    "successful": 1,
+    "failed": 0
+  },
+  "created": false
+}
+```
+2、上机动手实战演练基于external version进行乐观锁并发控制
+
+external version
+
+es提供了一个feature，就是说，你可以不用它提供的内部_version版本号来进行并发控制，可以基于你自己维护的一个版本号来进行并发控制。举个列子，假如你的数据在mysql里也有一份，然后你的应用系统本身就维护了一个版本号，无论是什么自己生成的，程序控制的。这个时候，你进行乐观锁并发控制的时候，可能并不是想要用es内部的_version来进行控制，而是用你自己维护的那个version来进行控制。
+
+?version=1  
+?version=1&version_type=external
+
+version_type=external，唯一的区别在于，_version，只有当你提供的version与es中的_version一模一样的时候，才可以进行修改，只要不一样，就报错；当version_type=external的时候，只有当你提供的version比es中的_version大的时候，才能完成修改
+
+es，_version=1，?version=1，才能更新成功  
+es，_version=1，?version>1&version_type=external，才能成功，比如说?version=2&  version_type=external
+
+（1）先构造一条数据
+```
+PUT /test_index/test_type/8
+{
+  "test_field": "test"
+}
+
+{
+  "_index": "test_index",
+  "_type": "test_type",
+  "_id": "8",
+  "_version": 1,
+  "result": "created",
+  "_shards": {
+    "total": 2,
+    "successful": 1,
+    "failed": 0
+  },
+  "created": true
+}
+```
+（2）模拟两个客户端同时查询到这条数据
+```
+GET /test_index/test_type/8
+
+{
+  "_index": "test_index",
+  "_type": "test_type",
+  "_id": "8",
+  "_version": 1,
+  "found": true,
+  "_source": {
+    "test_field": "test"
+  }
+}
+```
+（3）第一个客户端先进行修改，此时客户端程序是在自己的数据库中获取到了这条数据的最新版本号，比如说是2
+```
+PUT /test_index/test_type/8?version=2&version_type=external
+{
+  "test_field": "test client 1"
+}
+
+{
+  "_index": "test_index",
+  "_type": "test_type",
+  "_id": "8",
+  "_version": 2,
+  "result": "updated",
+  "_shards": {
+    "total": 2,
+    "successful": 1,
+    "failed": 0
+  },
+  "created": false
+}
+```
+（4）模拟第二个客户端，同时拿到了自己数据库中维护的那个版本号，也是2，同时基于version=2发起了修改
+```
+PUT /test_index/test_type/8?version=2&version_type=external
+{
+  "test_field": "test client 2"
+}
+
+{
+  "error": {
+    "root_cause": [
+      {
+        "type": "version_conflict_engine_exception",
+        "reason": "[test_type][8]: version conflict, current version [2] is higher or equal to the one provided [2]",
+        "index_uuid": "6m0G7yx7R1KECWWGnfH1sw",
+        "shard": "1",
+        "index": "test_index"
+      }
+    ],
+    "type": "version_conflict_engine_exception",
+    "reason": "[test_type][8]: version conflict, current version [2] is higher or equal to the one provided [2]",
+    "index_uuid": "6m0G7yx7R1KECWWGnfH1sw",
+    "shard": "1",
+    "index": "test_index"
+  },
+  "status": 409
+}
+```
+（5）在并发控制成功后，重新基于最新的版本号发起更新
+```
+GET /test_index/test_type/8
+
+{
+  "_index": "test_index",
+  "_type": "test_type",
+  "_id": "8",
+  "_version": 2,
+  "found": true,
+  "_source": {
+    "test_field": "test client 1"
+  }
+}
+
+PUT /test_index/test_type/8?version=3&version_type=external
+{
+  "test_field": "test client 2"
+}
+
+{
+  "_index": "test_index",
+  "_type": "test_type",
+  "_id": "8",
+  "_version": 3,
+  "result": "updated",
+  "_shards": {
+    "total": 2,
+    "successful": 1,
+    "failed": 0
+  },
+  "created": false
+}
+```
+3、什么是partial update？
+
+PUT /index/type/id，创建文档&替换文档，就是一样的语法
+
+一般对应到应用程序中，每次的执行流程基本是这样的：
+
+（1）应用程序先发起一个get请求，获取到document，展示到前台界面，供用户查看和修改  
+（2）用户在前台界面修改数据，发送到后台  
+（3）后台代码，会将用户修改的数据在内存中进行执行，然后封装好修改后的全量数据  
+（4）然后发送PUT请求，到es中，进行全量替换  
+（5）es将老的document标记为deleted，然后重新创建一个新的document  
+```
+partial update
+
+post /index/type/id/_update 
+{
+   "doc": {
+      "要修改的少数几个field即可，不需要全量的数据"
+   }
+}
+```
+看起来，好像就比较方便了，每次就传递少数几个发生修改的field即可，不需要将全量的document数据发送过去
+
+4、图解partial update实现原理以及其优点
+
+partial update，看起来很方便的操作，实际内部的原理是什么样子的，然后它的优点是什么
+
+5、上机动手实战演练partial update
+```
+PUT /test_index/test_type/10
+{
+  "test_field1": "test1",
+  "test_field2": "test2"
+}
+
+POST /test_index/test_type/10/_update
+{
+  "doc": {
+    "test_field2": "updated test2"
+  }
+}
+```
+![avator](http://i.caigoubao.cc/613363/elasticsearch%E5%9B%BE%E8%A7%A3/%E5%9B%BE%E8%A7%A3partial%20update%E5%AE%9E%E7%8E%B0%E5%8E%9F%E7%90%86%E4%BB%A5%E5%8F%8A%E5%85%B6%E4%BC%98%E7%82%B9.png)
+
+5.es，其实是有个内置的脚本支持的，可以基于groovy脚本实现各种各样的复杂操作
+基于groovy脚本，如何执行partial update
+es scripting module，我们会在高手进阶篇去讲解，这里就只是初步讲解一下
+```
+PUT /test_index/test_type/11
+{
+  "num": 0,
+  "tags": []
+}
+```
+（1）内置脚本
+```
+POST /test_index/test_type/11/_update
+{
+   "script" : "ctx._source.num+=1"
+}
+
+{
+  "_index": "test_index",
+  "_type": "test_type",
+  "_id": "11",
+  "_version": 2,
+  "found": true,
+  "_source": {
+    "num": 1,
+    "tags": []
+  }
+}
+```
+（2）外部脚本
+```
+ctx._source.tags+=new_tag
+
+POST /test_index/test_type/11/_update
+{
+  "script": {
+    "lang": "groovy", 
+    "file": "test-add-tags",
+    "params": {
+      "new_tag": "tag1"
+    }
+  }
+}
+```
+（3）用脚本删除文档
+```
+ctx.op = ctx._source.num == count ? 'delete' : 'none'
+
+POST /test_index/test_type/11/_update
+{
+  "script": {
+    "lang": "groovy",
+    "file": "test-delete-document",
+    "params": {
+      "count": 1
+    }
+  }
+}
+```
+（4）upsert操作
+```
+POST /test_index/test_type/11/_update
+{
+  "doc": {
+    "num": 1
+  }
+}
+
+{
+  "error": {
+    "root_cause": [
+      {
+        "type": "document_missing_exception",
+        "reason": "[test_type][11]: document missing",
+        "index_uuid": "6m0G7yx7R1KECWWGnfH1sw",
+        "shard": "4",
+        "index": "test_index"
+      }
+    ],
+    "type": "document_missing_exception",
+    "reason": "[test_type][11]: document missing",
+    "index_uuid": "6m0G7yx7R1KECWWGnfH1sw",
+    "shard": "4",
+    "index": "test_index"
+  },
+  "status": 404
+}
+```
+如果指定的document不存在，就执行upsert中的初始化操作；如果指定的document存在，就执行doc或者script指定的partial update操作
+```
+POST /test_index/test_type/11/_update
+{
+   "script" : "ctx._source.num+=1",
+   "upsert": {
+       "num": 0,
+       "tags": []
+   }
+}
+```
+6.图解partial update内置乐观锁并发控制  
+（1）partial update内置乐观锁并发控制  
+（2）retry_on_conflict  
+（3）_version  
+post /index/type/id/_update?retry_on_conflict=5&version=6
+![avator](http://i.caigoubao.cc/613363/elasticsearch%E5%9B%BE%E8%A7%A3/partial%20update%E5%86%85%E7%BD%AE%E4%B9%90%E8%A7%82%E9%94%81%E5%B9%B6%E5%8F%91%E6%8E%A7%E5%88%B6.png)
+课程大纲
+
+7、批量查询的好处
+
+就是一条一条的查询，比如说要查询100条数据，那么就要发送100次网络请求，这个开销还是很大的
+如果进行批量查询的话，查询100条数据，就只要发送1次网络请求，网络请求的性能开销缩减100倍
+
+、mget的语法
+
+（1）一条一条的查询
+```
+GET /test_index/test_type/1
+GET /test_index/test_type/2
+```
+（2）mget批量查询
+```
+GET /_mget
+{
+   "docs" : [
+      {
+         "_index" : "test_index",
+         "_type" :  "test_type",
+         "_id" :    1
+      },
+      {
+         "_index" : "test_index",
+         "_type" :  "test_type",
+         "_id" :    2
+      }
+   ]
+}
+
+{
+  "docs": [
+    {
+      "_index": "test_index",
+      "_type": "test_type",
+      "_id": "1",
+      "_version": 2,
+      "found": true,
+      "_source": {
+        "test_field1": "test field1",
+        "test_field2": "test field2"
+      }
+    },
+    {
+      "_index": "test_index",
+      "_type": "test_type",
+      "_id": "2",
+      "_version": 1,
+      "found": true,
+      "_source": {
+        "test_content": "my test"
+      }
+    }
+  ]
+}
+```
+（3）如果查询的document是一个index下的不同type种的话
+```
+GET /test_index/_mget
+{
+   "docs" : [
+      {
+         "_type" :  "test_type",
+         "_id" :    1
+      },
+      {
+         "_type" :  "test_type",
+         "_id" :    2
+      }
+   ]
+}
+```
+（4）如果查询的数据都在同一个index下的同一个type下，最简单了
+```
+GET /test_index/test_type/_mget
+{
+   "ids": [1, 2]
+}
+```
+3、mget的重要性
+
+可以说mget是很重要的，一般来说，在进行查询的时候，如果一次性要查询多条数据的话，那么一定要用batch批量操作的api
+尽可能减少网络开销次数，可能可以将性能提升数倍，甚至数十倍，非常非常之重要
+
+
+
+
+
+
+
 
